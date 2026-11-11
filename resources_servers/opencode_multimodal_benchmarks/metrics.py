@@ -57,3 +57,17 @@ def pass_at_k(tasks: list[list[dict[str, Any]]], *, k: int) -> float | None:
         correct = sum(int(row["reward"]) for row in valid)
         estimates.append(1.0 if n - correct < k else 1.0 - comb(n - correct, k) / comb(n, k))
     return sum(estimates) / len(estimates) if estimates else None
+
+
+def verifier_measurements(tasks: list[list[dict[str, Any]]]) -> list[list[dict[str, Any]]]:
+    """Project correctness for benchmark metrics without changing saved training rewards."""
+
+    def correctness(row):
+        components = row.get("reward_components") or {}
+        if "verifier" in components:
+            return components["verifier"]
+        # Older shaped rows recorded the original grade only in tool-reward evidence.
+        tools = row.get("opencode_tool_reward") or {}
+        return tools.get("base_reward", row["reward"])
+
+    return [[row | {"reward": correctness(row)} for row in repeats] for repeats in tasks]

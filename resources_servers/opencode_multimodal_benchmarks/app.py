@@ -22,7 +22,7 @@ from nemo_gym.server_runtime import (
 from nemo_gym.utils import explicit_causes, is_nemo_gym_fastapi_entrypoint
 from nemo_gym.utils.exception_inspection import error_to_http_status
 from nemo_gym.verification import JUDGE_FAILURES, JudgeError, call_judge, is_judge_failure
-from resources_servers.opencode_multimodal_benchmarks.metrics import average_repeats, pass_at_k
+from resources_servers.opencode_multimodal_benchmarks.metrics import average_repeats, pass_at_k, verifier_measurements
 from resources_servers.opencode_multimodal_benchmarks.reporting import benchmark_report
 from resources_servers.opencode_multimodal_benchmarks.verifier import (
     VisualVerifier,
@@ -229,6 +229,7 @@ class VisualBenchmarksServer(VisualVerifier, SimpleResourcesServer):
         expected_repeats: Mapping[tuple[str, str], set[int]] | None = None,
     ) -> dict[str, Any]:
         """Report headline scores only when every received attempt has a valid measurement."""
+        tasks = verifier_measurements(tasks)
         grouped = {}
         for repeats in tasks:
             if repeats:

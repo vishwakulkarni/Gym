@@ -207,3 +207,81 @@ def test_http_aggregation_keeps_masked_repeat_identities(repeated_benchmark):
     assert result["agent_metrics"][f"{benchmark}/complete"] is False
     assert "accuracy" not in result["agent_metrics"]
     assert f"{benchmark}/accuracy" not in result["key_metrics"]
+
+
+@pytest.mark.parametrize("benchmark", ["VStarBench", "HRBench8K", "VTCBench", "ZeroBench", "AgentX"])
+@pytest.mark.parametrize("legacy", [False, True])
+@pytest.mark.parametrize("adjustment", [-0.05, 0.1])
+def test_accuracy_uses_correctness_without_mutating_shaped_training_reward(benchmark, legacy, adjustment):
+    config_type, server_type = (
+        (AgentXConfig, AgentXServer) if benchmark == "AgentX" else (VisualBenchmarksConfig, VisualBenchmarksServer)
+    )
+    server = server_type(
+        config=config_type(host="127.0.0.1", port=12345, name="benchmark", entrypoint="app.py"),
+        server_client=MagicMock(spec=ServerClient),
+    )
+    score = 0.65 if benchmark == "AgentX" else 1.0
+    rows = [
+        {
+            TASK_INDEX_KEY_NAME: 0,
+            ROLLOUT_INDEX_KEY_NAME: repeat,
+            "reward": score if repeat == 0 else 0.0,
+            "verifier_metadata": {
+                "benchmark": benchmark,
+                "index": "0",
+                "expected_samples": 1,
+                "cycle_category": "1",
+                "category": "spatial",
+                "l2_category": "detail",
+                "split": "test",
+                "modality": "Image",
+            },
+        }
+        for repeat in range(5)
+    ]
+    expected = aggregate(server, rows)
+    assert expected.agent_metrics["accuracy"] == pytest.approx(1.0 if benchmark == "ZeroBench" else score / 5)
+    for row in rows:
+        base = row["reward"]
+        auxiliary = adjustment if base > 0 else 0.0
+        row["reward"] = base + auxiliary
+        if legacy:
+            row["opencode_tool_reward"] = {"base_reward": base}
+        else:
+            row["reward_components"] = {"verifier": base, "opencode_tool_reward": auxiliary}
+    shaped = deepcopy(rows)
+    result = aggregate(server, rows)
+    assert result.agent_metrics["accuracy"] == expected.agent_metrics["accuracy"]
+    assert result.agent_metrics[f"{benchmark}/accuracy"] == expected.agent_metrics[f"{benchmark}/accuracy"]
+    if benchmark == "ZeroBench":
+        assert result.agent_metrics["ZeroBench/pass@1"] == 0.2
+        assert result.agent_metrics["ZeroBench/pass@5"] == 1.0
+    if benchmark == "AgentX":
+        assert result.agent_metrics["AgentX/Image/accuracy"] == pytest.approx(0.13)
+    for actual, baseline in zip(result.repeat_level_metrics, expected.repeat_level_metrics, strict=True):
+        for key in baseline:
+            if key == "accuracy" or key.endswith("/accuracy") or key == "ZeroBench/pass@1":
+                assert actual[key] == baseline[key]
+        assert actual["mean/reward"] == rows[actual[ROLLOUT_INDEX_KEY_NAME]]["reward"]
+    assert result.agent_metrics["mean/reward"] == pytest.approx((score + adjustment) / 5)
+    assert rows == shaped
+    assert rows[0]["reward"] == score + adjustment
+
+
+@pytest.mark.asyncio
+async def test_vtcbench_verification_with_tools_remains_correctness_only():
+    from resources_servers.opencode_multimodal_benchmarks.tests.test_app import request
+    from resources_servers.opencode_multimodal_benchmarks.tests.test_app import server as make_server
+    from resources_servers.opencode_multimodal_benchmarks.tests.test_rewards import tool_response, trajectory
+
+    server = make_server.__wrapped__()
+    body = request("VTCBench", "A")
+    body.response = tool_response("A")
+    body.ng_trajectory = trajectory()
+    result = await server.verify(body)
+    assert result.reward == 1.0
+    assert "opencode_tool_reward" not in result.model_dump()
+    assert "reward_components" not in result.model_dump()
+    metrics = server.compute_metrics([[result.model_dump()]])
+    assert metrics["accuracy"] == metrics["VTCBench/accuracy"] == 1.0
+    assert result.reward == 1.0
