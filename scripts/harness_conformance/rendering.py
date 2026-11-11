@@ -64,7 +64,7 @@ def scenario_details(scenarios: list[dict]) -> str:
         lines += [f"**{tier}**", ""]
         for label, names in (("Passing", passing), ("Not passing", not_passing)):
             listed = ", ".join(f"`{name}`" for name in names) or "None"
-            lines.append(f"- **{label}:** {listed}")
+            lines.append(f"- **Scenarios {label.lower()} {tier} checks:** {listed}")
         lines.append("")
     return "\n".join(lines)
 
