@@ -3782,9 +3782,9 @@ class TestRolloutCollection:
 
         assert {k: v for k, v in exported.items() if k.startswith(("coverage/", "retries/"))} == {
             "coverage/expected": 3,
-            "coverage/scored": 2,
+            "coverage/scored": 3,
             "coverage/missing": 0,
-            "coverage/not_scored": 1,
+            "coverage/not_scored": 0,
             "coverage/measured": 2,
             "coverage/masked": 0,
             "coverage/unscored": 0,
@@ -4017,14 +4017,14 @@ class TestRolloutCollection:
         assert "reward" not in failure
 
     @pytest.mark.parametrize("count_judge_failure", [False, True])
-    async def test_masked_judge_failure_counts_as_zero_only_when_opted_in(
+    async def test_unrecoverable_masked_judge_failure_counts_as_zero_by_default(
         self,
         tmp_path: Path,
         monkeypatch: pytest.MonkeyPatch,
         empty_global_config: MagicMock,
         count_judge_failure: bool,
     ) -> None:
-        """Online and offline aggregation honor the opt-in without rewriting failure evidence."""
+        """Online and offline aggregation settle an unanswered judge failure without rewriting evidence."""
         input_path = tmp_path / "input.jsonl"
         input_path.write_text(
             "".join(
@@ -4077,9 +4077,9 @@ class TestRolloutCollection:
         )
         assert len(metrics) == 2
         for result, inputs in zip(metrics, metric_inputs):
-            assert result.key_metrics == {"mean/reward": 0.75 if count_judge_failure else 1.0}
+            assert result.key_metrics == {"mean/reward": 0.75}
             assert result.agent_metrics.get("coverage/masked_rollouts", 0) == 0
-            assert len(inputs) == (4 if count_judge_failure else 3)
+            assert len(inputs) == 4
             assert all("failure_kind" not in row and "failure_reason" not in row for row in inputs)
         assert sidecar_path.read_bytes() == original_sidecar
         saved_failure = orjson.loads(original_sidecar)
@@ -4091,7 +4091,7 @@ class TestRolloutCollection:
     @pytest.mark.parametrize("num_failures", [1, 4])
     @pytest.mark.parametrize("counted_classes", [[], [AGENT_RUN_ERROR_FAILURE_CLASS], ["judge_failed"]])
     @pytest.mark.parametrize("disable_aggregation", [False, True])
-    async def test_all_judge_failures_only_produce_metrics_when_explicitly_counted(
+    async def test_all_unrecoverable_judge_failures_produce_zero_metrics_by_default(
         self,
         tmp_path: Path,
         monkeypatch: pytest.MonkeyPatch,
@@ -4100,7 +4100,7 @@ class TestRolloutCollection:
         counted_classes: list[str],
         disable_aggregation: bool,
     ) -> None:
-        """An opted-in all-failure run has a score, but never synthetic successful rollouts."""
+        """An unrecoverable all-failure run scores zero without adding synthetic successful rollouts."""
         input_path = tmp_path / "input.jsonl"
         input_path.write_text(
             "".join(
@@ -4135,14 +4135,8 @@ class TestRolloutCollection:
             disable_aggregation=disable_aggregation,
             disable_health_check=True,
         )
-        counted = "judge_failed" in counted_classes
-        if counted:
-            results = await RolloutCollectionHelper().run_from_config(config)
-            assert len(results) == num_failures and all(row["mask_sample"] for row in results)
-        else:
-            # A nonempty opt-in for another class must not bypass the no-results guard.
-            with pytest.raises(RuntimeError, match="produced a result"):
-                await RolloutCollectionHelper().run_from_config(config)
+        results = await RolloutCollectionHelper().run_from_config(config)
+        assert len(results) == num_failures and all(row["mask_sample"] for row in results)
 
         sidecar_path = _failures_path_for(output_path)
         original_sidecar = sidecar_path.read_bytes()
@@ -4155,7 +4149,7 @@ class TestRolloutCollection:
         )
         assert output_path.read_bytes() == b""
         online_path = output_path.with_stem("output_aggregate_metrics").with_suffix(".json")
-        if counted and not disable_aggregation:
+        if not disable_aggregation:
             assert orjson.loads(online_path.read_bytes())[0]["key_metrics"] == {"mean/reward": 0.0}
         else:
             assert not online_path.exists() and not metric_inputs
@@ -4168,14 +4162,11 @@ class TestRolloutCollection:
                 disable_health_check=True,
             )
         )
-        if counted:
-            assert orjson.loads(offline_path.read_bytes())[0]["key_metrics"] == {"mean/reward": 0.0}
-            assert len(metric_inputs) == (1 if disable_aggregation else 2)
-            for inputs in metric_inputs:
-                assert len(inputs) == num_failures
-                assert all(row["reward"] == 0.0 and row["mask_sample"] is False for row in inputs)
-        else:
-            assert offline_path is None and not metric_inputs
+        assert orjson.loads(offline_path.read_bytes())[0]["key_metrics"] == {"mean/reward": 0.0}
+        assert len(metric_inputs) == (1 if disable_aggregation else 2)
+        for inputs in metric_inputs:
+            assert len(inputs) == num_failures
+            assert all(row["reward"] == 0.0 and row["mask_sample"] is False for row in inputs)
         assert sidecar_path.read_bytes() == original_sidecar
         assert output_path.read_bytes() == (tmp_path / "merged.jsonl").read_bytes() == b""
 
@@ -4659,7 +4650,7 @@ class TestRolloutCollection:
         assert printed.count("rollout dropped from the score") == 1
         assert "class=judge_failed" in printed
         assert "judge 503" in printed
-        assert "Rollouts missing from the score: 1 of 2 materialized" in printed
+        assert "Rollouts missing from the score" not in printed
 
     @pytest.mark.parametrize("count_failures_as_zero", [False, True])
     async def test_run_from_config_reports_coverage_against_the_materialized_input_on_resume(
@@ -4707,16 +4698,13 @@ class TestRolloutCollection:
             require_complete=True,
             count_failure_classes_as_zero=[AGENT_RUN_ERROR_FAILURE_CLASS] if count_failures_as_zero else [],
         )
-        with pytest.raises(RuntimeError, match="EVAL FAILED: 2/3 samples completed"):
-            await Helper().run_from_config(config)
+        await Helper().run_from_config(config)
 
         printed = capsys.readouterr().out
-        # The run is rejected before it counts anything: no score, whatever would have been counted as zero.
-        assert "Not computing aggregate metrics: the run is incomplete" in printed
-        assert "Counting 1 failure row(s) as scored zeros" not in printed
-        if not count_failures_as_zero:
-            assert "Rollouts missing from the score: 1 of 3 materialized" in printed
-            assert "Metrics cover: 2 of 3 rollouts" in printed
+        # The terminal failure settles as zero by default without another episode.
+        assert "Computing aggregate metrics" in printed
+        assert "Rollouts missing from the score" not in printed
+        assert "Not computing aggregate metrics" not in printed
 
     async def test_run_from_config_resume_progress_counts_only_dispatched_rollouts(
         self,
@@ -6737,10 +6725,8 @@ class TestRolloutCollection:
         assert error.value.exit_code == 75
         assert not offset_fpath.exists()
 
-        # Failure accounting still reaches the cap on this new run.
-        with pytest.raises(nemo_gym.rollouts.rollout_collection.IncompleteEvaluationError) as error:
-            await Helper().run_from_config(RolloutCollectionConfig(**base, resume_from_cache=True))
-        assert error.value.exit_code == 76
+        # Reaching this run's saved cap settles the failed episode as zero.
+        await Helper().run_from_config(RolloutCollectionConfig(**base, resume_from_cache=True))
         input_rows, *_ = RolloutCollectionHelper()._load_from_cache(
             RolloutCollectionConfig(**base, resume_from_cache=True)
         )
@@ -14041,7 +14027,7 @@ class TestOmittedRolloutRecords:
         assert RolloutStore.read(output_fpath).coverage()["complete"]
 
     @pytest.mark.parametrize("record_omitted", [False, True], ids=["omitted unrecorded", "omitted recorded"])
-    async def test_an_interrupted_attempt_is_saved_once_and_resume_selects_the_next_one(
+    async def test_an_unrecoverable_interruption_is_saved_once_and_settles_as_zero(
         self,
         tmp_path: Path,
         monkeypatch: pytest.MonkeyPatch,
@@ -14065,10 +14051,9 @@ class TestOmittedRolloutRecords:
         input_fpath.write_bytes(orjson.dumps(failing_row(0)) + b"\n")
         output_fpath = tmp_path / "output.jsonl"
 
-        with pytest.raises(RuntimeError, match="produced a result"):
-            await RolloutCollectionHelper().run_from_config(
-                self._config(input_fpath, output_fpath, record_omitted_rollouts=record_omitted)
-            )
+        await RolloutCollectionHelper().run_from_config(
+            self._config(input_fpath, output_fpath, record_omitted_rollouts=record_omitted)
+        )
 
         # One row, the history's own: the option adds no second record of the same interruption.
         (row,) = [orjson.loads(line) for line in _failures_path_for(output_fpath).read_bytes().splitlines()]
@@ -14084,7 +14069,8 @@ class TestOmittedRolloutRecords:
         )
         assert len(posted) == dispatched
         coverage = RolloutStore.read(output_fpath).coverage()
-        assert not coverage["complete"] and coverage["counted_failures"] == 0 and coverage["retryable"] == 0
+        assert coverage["complete"] and coverage["final_zeros"] == 1
+        assert coverage["counted_failures"] == 0 and coverage["retryable"] == 0
         assert len(_failures_path_for(output_fpath).read_bytes().splitlines()) == 1
 
 
@@ -14359,7 +14345,16 @@ class TestCompletionCountsFinalZeros:
         [
             pytest.param(_FINAL_ZERO, [], None, id="final-zero-completes"),
             pytest.param(
-                {NG_FAILURE_CLASS_KEY: "judge_failed", "reward": 0.0}, [], "2/3", id="judge-failure-stays-missing"
+                {NG_FAILURE_CLASS_KEY: "agent_run_error", NG_TERMINAL_KEY: True},
+                [],
+                None,
+                id="terminal-failure-is-zero",
+            ),
+            pytest.param(
+                {NG_FAILURE_CLASS_KEY: "judge_failed", "reward": 0.0},
+                [],
+                None,
+                id="unrecoverable-judge-failure-is-zero",
             ),
             pytest.param(
                 {NG_FAILURE_CLASS_KEY: "agent_run_error"},
@@ -14421,7 +14416,10 @@ class TestCompletionCountsFinalZeros:
         if outcome is None and not disable_aggregation:
             # The final zero and the metrics-only count enter the score, a judge failure does not.
             counted_zero = (
-                third.get(NG_FAILURE_COUNTS_AS_ZERO_KEY) is True or third[NG_FAILURE_CLASS_KEY] in count_classes
+                third.get(NG_FAILURE_COUNTS_AS_ZERO_KEY) is True
+                or third[NG_FAILURE_CLASS_KEY] in count_classes
+                or third.get(NG_TERMINAL_KEY) is True
+                or third[NG_FAILURE_CLASS_KEY] == "judge_failed"
             )
             assert len(aggregated["rows"]) == (3 if counted_zero else 2)
         else:

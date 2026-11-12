@@ -478,8 +478,8 @@ async def test_native_recovery_preserves_terminal_failures_and_unscored_completi
     assert store.coverage()["failed"] == 1
     assert store.selected("success")[1]["reward"] == 0.0
     config.require_complete = True
-    with pytest.raises(RuntimeError, match="2/3 samples completed"):
-        await RolloutCollectionHelper().run_from_config(config)
+    await RolloutCollectionHelper().run_from_config(config)
+    assert RolloutStore.read(Path(config.output_jsonl_fpath)).coverage()["final_zeros"] == 1
     assert len(calls) == 4  # The unscored completion and terminal failure are not retried.
     monkeypatch.setattr(RolloutCollectionHelper, "_call_aggregate_metrics", AsyncMock(return_value=None))
     merged = Path(config.output_jsonl_fpath).with_name("merged.jsonl")
@@ -496,7 +496,7 @@ async def test_native_recovery_preserves_terminal_failures_and_unscored_completi
         1,
         0,
         1,
-        1,
+        2,
     )
 
 
@@ -1806,7 +1806,11 @@ async def test_batch_status_uses_current_journal_attempts(tmp_path, monkeypatch,
     assert offline["completed_rollout_count"] == 0
     assert offline["remaining_rollout_count"] == 1
     assert offline["failures_by_class"] == expected_failures
-    post.assert_not_awaited()
+    if latest_outcome == "failure":
+        post.assert_awaited_once()  # Offline aggregation scores the exhausted failure as zero.
+        assert post.call_args.kwargs["url_path"] == "/aggregate_metrics"
+    else:
+        post.assert_not_awaited()
     assert output.read_bytes() == original_output
 
 
@@ -1855,12 +1859,17 @@ async def test_interruption_failures_do_not_spend_budget_or_create_retry_progres
         expected_exit = (
             76 if kind == "judge_failed" else 76 if unknown_kill else (75 if mixed_success and invocation == 0 else 1)
         )
-        with pytest.raises(IncompleteEvaluationError) as error:
+        if kind == "admission":
+            with pytest.raises(IncompleteEvaluationError) as error:
+                await RolloutCollectionHelper().run_from_config(runner_config)
+            assert error.value.exit_code == expected_exit
+            with pytest.raises(IncompleteEvaluationError) as saved_error:
+                _check_saved_completion(output)
+            assert saved_error.value.exit_code == expected_exit
+        else:
             await RolloutCollectionHelper().run_from_config(runner_config)
-        assert error.value.exit_code == expected_exit
-        with pytest.raises(IncompleteEvaluationError) as saved_error:
             _check_saved_completion(output)
-        assert saved_error.value.exit_code == expected_exit
+            assert RolloutStore.read(output).coverage()["final_zeros"] == 3 - int(mixed_success)
         reader = RolloutStore.read(output)
         counted = (3 - int(mixed_success)) if kind == "judge_failed" else 0
         assert reader.coverage()["counted_failures"] == counted
@@ -2122,7 +2131,10 @@ async def test_judge_class_with_shared_kind_keeps_a_recoverable_saved_answer(
         )
     )
     install_fake_server_client(monkeypatch, post)
-    with pytest.raises(RuntimeError, match="None of the 3 dispatched"):
+    if has_answer:
+        with pytest.raises(RuntimeError, match="None of the 3 dispatched"):
+            await RolloutCollectionHelper().run_from_config(runner_config)
+    else:
         await RolloutCollectionHelper().run_from_config(runner_config)
     failures = RolloutStore.read(Path(runner_config.output_jsonl_fpath)).failures()
     assert len(failures) == 3
@@ -2251,7 +2263,7 @@ async def test_typed_episode_outcomes_settle_stop_or_retry_through_collection_an
                 "reward": 0.0,
                 "response": answer,
             }
-        elif task == "4":  # An unknown interruption grants no automatic retry and invents no model zero.
+        elif task == "4":  # A recorded interruption with no permitted retry settles as zero.
             reply["failure"] = {
                 "failure_reason": "Interrupted, cause unknown",
                 "terminal": False,
@@ -2290,15 +2302,17 @@ async def test_typed_episode_outcomes_settle_stop_or_retry_through_collection_an
         await RolloutCollectionHelper().run_from_config(runner_config)
         first = RolloutStore.read(output)
         assert sorted(calls) == [(str(i), 0) for i in range(7)]
-        assert first.coverage()["final_zeros"] == 1
+        assert first.coverage()["final_zeros"] == 2
+        assert not first.coverage()["complete"]  # Cleanup is unconfirmed and a judge answer still needs grading.
         assert [row["_ng_task_index"] for row in first.pending()] == [2]
         assert sorted((row["_ng_task_index"], row["reward"]) for row in aggregated[-1]) == [
             (0, 1.0),
             (1, 0.0),
+            (4, 0.0),
             (5, 0.0),
         ]
         metrics = json.loads(aggregate_metrics_path_for(output).read_text())
-        assert metrics[0]["agent_metrics"]["mean/reward"] == pytest.approx(1 / 3)
+        assert metrics[0]["agent_metrics"]["mean/reward"] == pytest.approx(1 / 4)
         failures = {row["_ng_task_index"]: row for row in first.failures()}
         assert "reward" not in failures[1] and "response" not in failures[1]
         assert not failures[1].get("ng_verifier_invocations")
@@ -2319,14 +2333,17 @@ async def test_typed_episode_outcomes_settle_stop_or_retry_through_collection_an
         assert reloaded.pending() == []
         kept = {row["_ng_task_index"]: row for row in reloaded.failures()}
         assert kept[3]["response"] == kept[6]["_ng_failure_partial_response"] == answer
-        assert reloaded.coverage()["final_zeros"] == 1 and reloaded.coverage()["successful"] == 2
+        assert reloaded.coverage()["final_zeros"] == 3 and reloaded.coverage()["successful"] == 2
         assert kept[2]["_ng_attempt_index"] == 3 and kept[2]["_ng_failure_max_attempts"] == 3
         assert reloaded.coverage()["failure_budget_exhausted"] == 1
         assert output.with_name(output.stem + "_failures.jsonl").read_bytes().startswith(failure_bytes)
-        assert all(
-            sorted((row["_ng_task_index"], row["reward"]) for row in rows) == [(0, 1.0), (1, 0.0), (5, 0.0)]
-            for rows in aggregated
-        )
+        assert sorted((row["_ng_task_index"], row["reward"]) for row in aggregated[-1]) == [
+            (0, 1.0),
+            (1, 0.0),
+            (2, 0.0),
+            (4, 0.0),
+            (5, 0.0),
+        ]
 
 
 def _identity_case(tmp_path: Path, settings: dict) -> tuple:
@@ -2610,3 +2627,21 @@ async def test_a_connection_that_dropped_is_reported_as_possibly_delivered_and_n
     assert len(calls) == 1
     assert (outcome.source, outcome.delivery) == ("collector", "possibly_delivered")
     assert outcome.exception_type == "ServerDisconnectedError"
+
+
+async def test_all_explicit_fail_exclusions_still_report_no_score(runner_config, monkeypatch):
+    runner_config.require_complete = True
+    runner_config.disable_aggregation = False
+    failure = {
+        "_ng_failure_class": "agent_run_error",
+        "_ng_failure_terminal": True,
+        "failure_outcome_action": "fail",
+    }
+    install_fake_server_client(monkeypatch, AsyncMock(return_value=FakeResponse(200, failure)))
+    aggregate = AsyncMock()
+    monkeypatch.setattr(RolloutCollectionHelper, "_call_aggregate_metrics", aggregate)
+    with pytest.raises(RuntimeError, match="None of the 3 dispatched"):
+        await RolloutCollectionHelper().run_from_config(runner_config)
+    aggregate.assert_not_awaited()
+    coverage = RolloutStore.read(Path(runner_config.output_jsonl_fpath)).coverage()
+    assert coverage["failed_excluded"] == 3 and coverage["final_zeros"] == 0

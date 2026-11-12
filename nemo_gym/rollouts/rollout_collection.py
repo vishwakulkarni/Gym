@@ -2872,7 +2872,9 @@ def _final_zero_failure_rows(
 
 def _counts_as_zero(row: Mapping[str, Any], wanted: set) -> bool:
     """Whether a rollout's latest sidecar row enters the metrics as a zero: its class is wanted, or it is marked."""
-    return _matches_failure_class(row, wanted) or row.get(NG_FAILURE_COUNTS_AS_ZERO_KEY) is True
+    return row.get("failure_outcome_action") != "fail" and (
+        _matches_failure_class(row, wanted) or row.get(NG_FAILURE_COUNTS_AS_ZERO_KEY) is True
+    )
 
 
 def _counted_failure_row(row: Dict[str, Any]) -> Dict[str, Any]:
@@ -4718,7 +4720,8 @@ executions → not run again (left to recovery)
             f"Rollout coverage: {completion['successful']}/{completion['expected']} completed, "
             f"of which {completion['measured']} measured, {completion['masked']} masked, "
             f"and {completion['unscored']} unscored; "
-            f"{completion['failed']} failed ({completion['failed_masked']} masked, not scored as zero), "
+            f"{completion['failed']} failed ({completion['failed_masked']} masked), "
+            f"{completion['final_zeros']} settled as zero, "
             f"{completion['intentionally_omitted']} intentionally omitted, "
             f"{completion['not_started']} not started, {completion['missing']} missing outcomes; "
             f"{completion['open']} open (no final result). "
@@ -4727,7 +4730,7 @@ executions → not run again (left to recovery)
         # Explicitly counted failures can provide a score even when no rollout
         # succeeded. Select attempts before applying that scoring policy.
         counted = await asyncio.to_thread(
-            lambda: _counted_failure_rows(store.failures(), config.count_failure_classes_as_zero)
+            lambda: _counted_failure_rows(store.failures_for_scoring(), config.count_failure_classes_as_zero)
         )
         missing = (
             await asyncio.to_thread(
@@ -4795,14 +4798,22 @@ executions → not run again (left to recovery)
         # the denominator, while health still reports it as a failure and no verifier execution is recorded for it.
         rejection: Optional[BaseException] = None
         if config.require_complete:
-            rejection = await asyncio.to_thread(
-                lambda: _credentials_rejected_stop(store.failures()) or _quota_exhausted_stop(store.failures())
+            unsettled = await asyncio.to_thread(
+                lambda: [
+                    row
+                    for row in store.failures_for_scoring()
+                    if not row.get(NG_FAILURE_COUNTS_AS_ZERO_KEY) and row.get("failure_outcome_action") != "fail"
+                ]
             )
+            rejection = _credentials_rejected_stop(unsettled) or _quota_exhausted_stop(unsettled)
         if rejection is None:
             rejection = config.completion_rejection(
                 expected=completion["expected"],
                 results=persisted_results,
-                completed=completion["successful"] - completion.get("masked_retryable", 0) + completion["final_zeros"],
+                completed=completion["successful"]
+                - completion.get("masked_retryable", 0)
+                + completion["final_zeros"]
+                + completion.get("failed_excluded", 0),
                 intentionally_omitted=completion["intentionally_omitted"],
                 retryable=completion["retryable"] > 0,
                 made_progress=store.progress_outcomes_recorded > 0,
@@ -6360,7 +6371,7 @@ class RolloutAggregationHelper(BaseModel):
 
         legacy_counted_ids = {_identity_key(row, group) for row in counted}
         for history in histories:
-            added = _counted_failure_rows(history.failures(), config.count_failure_classes_as_zero)
+            added = _counted_failure_rows(history.failures_for_scoring(), config.count_failure_classes_as_zero)
             if config.count_missing_rollouts_as_zero:
                 imputed = _missing_rollout_rows_counted_as_zero(
                     [materialized_path_for(history.output)], [], set(), history=history
@@ -6407,7 +6418,7 @@ class RolloutAggregationHelper(BaseModel):
         dropped.update(
             row[NG_FAILURE_CLASS_KEY]
             for history in histories
-            for row in history.failures()
+            for row in history.failures_for_scoring()
             if not _counts_as_zero(row, wanted)
         )
         components = [history.coverage() for history in histories]
@@ -6426,6 +6437,11 @@ class RolloutAggregationHelper(BaseModel):
             "unscored": unscored_rollouts,
             "failed": sum(c["failed"] for c in components) if inventory_known else None,
             "failed_final": sum(c["failed_final"] for c in components) if inventory_known else None,
+            **(
+                {"failed_excluded": sum(c.get("failed_excluded", 0) for c in components)}
+                if inventory_known and any(c.get("failed_excluded") for c in components)
+                else {}
+            ),
             "failed_masked": sum(c["failed_masked"] for c in components) if inventory_known else None,
             "failed_not_final": sum(c["failed_not_final"] for c in components) if inventory_known else None,
             "failed_by_class": dict(sum((Counter(c["failed_by_class"]) for c in components), Counter()))
@@ -6472,7 +6488,8 @@ class RolloutAggregationHelper(BaseModel):
             coverage += (
                 f"\nCoverage: {completion['successful']} completed "
                 f"({completion['measured']} measured, {completion['masked']} masked, {completion['unscored']} unscored), "
-                f"{completion['failed']} failed ({completion['failed_masked']} masked, not scored as zero), "
+                f"{completion['failed']} failed ({completion['failed_masked']} masked), "
+                f"{completion['failures_counted_as_zero']} counted as zero, "
                 f"{completion['intentionally_omitted']} intentionally omitted, "
                 f"{completion['not_started']} not started, {completion['missing']} missing outcomes; "
                 f"{completion['open']} open (no final result). "

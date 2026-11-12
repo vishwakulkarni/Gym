@@ -553,9 +553,10 @@ async def test_offline_aggregation_uses_newest_attempt_and_full_inventory(
             count_failure_classes_as_zero=[failure_class] if count_failures_as_zero else [],
         )
     )
-    assert [row["_ng_task_index"] for row in scored] == ([0, 1] if count_failures_as_zero else [0])
+    counted = count_failures_as_zero or failure_class == "judge_failed"
+    assert [row["_ng_task_index"] for row in scored] == ([0, 1] if counted else [0])
     assert all(row["reward"] == 0.0 for row in scored)
-    if count_failures_as_zero:
+    if counted:
         assert scored[1]["mask_sample"] is False and "failure_kind" not in scored[1]
     assert failures_path_for(output).read_bytes() == original_failures
     if merge_shards:
@@ -570,8 +571,8 @@ async def test_offline_aggregation_uses_newest_attempt_and_full_inventory(
         1,
         1,
     )
-    assert report["scored"] == 1 + int(count_failures_as_zero)
-    assert report["failures_counted_as_zero"] == int(count_failures_as_zero)
+    assert report["scored"] == 1 + int(counted)
+    assert report["failures_counted_as_zero"] == int(counted)
     assert (
         sum(
             report[key]
@@ -640,7 +641,7 @@ async def test_health_excludes_late_success_from_superseded_attempt(run, monkeyp
             input_glob=str(output), output_jsonl_fpath=str(target), merge_shards=merge_shards, health_check_workers=1
         )
     )
-    assert scored == []
+    assert [row["reward"] for row in scored] == ([0.0] if newer_failure else [])
     automatic = orjson.loads((target.parent / "quality_summary.json").read_bytes())["run"]
     standalone = run_health_checks(output, workers=1, output_dir=output.parent / "standalone").summary["run"]
     assert (automatic["artifacts"]["records"], standalone["artifacts"]["records"]) == (0, 0)
@@ -791,7 +792,9 @@ async def test_aggregation_reports_journal_failure_classes(run, monkeypatch, cap
             disable_health_check=True,
         )
     )
-    assert "1 judge_failed" in capsys.readouterr().out
+    report = orjson.loads(coverage_path_for(output.with_name("merged.jsonl")).read_bytes())
+    assert report["shards"][0]["failed_by_class"]["judge_failed"] == 1
+    assert report["failures_counted_as_zero"] == 1
 
 
 @pytest.mark.parametrize("versioned", [False, True])

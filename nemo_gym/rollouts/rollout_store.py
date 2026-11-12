@@ -21,6 +21,7 @@ execution numbers. There is no dispatch journal or second outcome commit.
 
 import hashlib
 import logging
+import math
 import os
 import time
 import uuid
@@ -708,6 +709,23 @@ class RolloutStore:
     def failures(self) -> list[dict]:
         """Latest failure payloads, including terminal skips classified as omitted."""
         return [row for row in self.selected("failure") + self.selected("omitted") if not row.get("_ng_omitted")]
+
+    def failures_for_scoring(self) -> list[dict]:
+        """Project settled failures as zeros without modifying saved outcomes or recovery evidence."""
+        rows = []
+        for row in self.failures():
+            key = self._state._key(row)
+            if self._state.disposition(key[0]) == "failure" and self._state.settled_failure(key):
+                if not self._state.payloads[key].explicit_fail:
+                    row = row | {"_ng_failure_counts_as_zero": True, "_ng_failure_terminal": True}
+                    if not self._state.payloads[key].final_zero and not (
+                        row.get("evaluation_completed") is True
+                        and type(row.get("reward")) in (int, float)
+                        and math.isfinite(row["reward"])
+                    ):
+                        row["reward"] = 0.0
+            rows.append(row)
+        return rows
 
     def inputs_for(self, results: list[dict]) -> list[dict]:
         return [self._state.expected[logical_rollout_id(result)] for result in results]

@@ -1187,12 +1187,12 @@ def test_a_producer_final_zero_settles_its_rollout_through_save_and_reload(tmp_p
                 store.record_outcome(row | marker | {"_ng_failure_terminal": True})
             elif task == 2:  # marked but not final: resume may still run it
                 store.record_outcome(row | marker | {"_ng_failure_terminal": False})
-            else:  # a class the reporting knob may count, without the producer's marker
+            else:  # an unmarked terminal failure also settles as zero
                 store.record_outcome(row | {"_ng_failure_class": "agent_run_error", "_ng_failure_terminal": True})
         live = store.coverage()
     reloaded = RolloutStore.read(output)
     for coverage in (live, reloaded.coverage()):
-        assert (coverage["successful"], coverage["final_zeros"], coverage["failed"]) == (1, 1, 3)
+        assert (coverage["successful"], coverage["final_zeros"], coverage["failed"]) == (1, 2, 3)
         assert coverage["failed_final"] >= 1 and coverage["complete"] is False
     # Neither the saved timeout policy nor an explicit one reopens the settled rollout as another model chance.
     pending = {row["_ng_task_index"] for row in reloaded.pending(retry_terminal_timeouts=retry_timeouts)}
@@ -1455,11 +1455,12 @@ async def test_offline_dropped_summary_excludes_producer_and_selected_zeros(
             disable_health_check=True,
         )
     )
-    assert [row["reward"] for row in metrics.await_args.args[0]] == [1.0, 0.0]
+    assert [row["reward"] for row in metrics.await_args.args[0]] == [1.0, 0.0, 0.0]
     report = orjson.loads(coverage_path_for(merged).read_bytes())
-    assert report["failures_counted_as_zero"] == 1
+    assert report["failures_counted_as_zero"] == 2
     printed = capsys.readouterr().out
-    assert "1 judge_failed" in printed
+    assert "1 judge_failed" not in printed
+    assert report["failed_by_class"]["judge_failed"] == 1
     assert "1 model_policy_response_timeout" not in printed
     assert snapshot(output) == before
 
@@ -1622,7 +1623,7 @@ def test_canonical_rejudge_links_new_verifier_and_preserves_history(prepared_run
 
 
 def test_coverage_reports_masked_failure_records_apart_from_masked_results(prepared_run):
-    """A judge outage leaves a failure record with ``mask_sample``: excluded from the score, not a zero. It is a
+    """A judge failure with no saved answer settles as zero while retaining its masked failure evidence. It is a
     failure, so it never counts under ``masked`` (completed results); ``failed_masked`` says how many failures are
     masked, and a final failure is not an open rollout."""
     output, prepare = prepared_run
@@ -1635,5 +1636,5 @@ def test_coverage_reports_masked_failure_records_apart_from_masked_results(prepa
     for coverage in (live, RolloutStore.read(output).coverage()):
         assert (coverage["expected"], coverage["successful"], coverage["measured"]) == (2, 1, 1)
         assert (coverage["failed"], coverage["failed_final"], coverage["failed_masked"]) == (1, 1, 1)
-        assert (coverage["masked"], coverage["final_zeros"], coverage["open"]) == (0, 0, 0)
-        assert coverage["complete"] is False
+        assert (coverage["masked"], coverage["final_zeros"], coverage["open"]) == (0, 1, 0)
+        assert coverage["complete"] is True
