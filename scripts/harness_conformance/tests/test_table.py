@@ -225,5 +225,5 @@ def test_declared_unsupported_scenario_needs_no_runtime_artifact(generation, mon
 
     monkeypatch.setattr(table, "run_suite", probes)
     table.regenerate(**kwargs)
-    assert "Declared unsupported (not run)" in page.read_text()
-    assert "0/1</Badge>" in page.read_text()
+    assert "✗ (P1:✗) — not run: declared unsupported" in page.read_text()
+    assert f"0/{len(table.SCENARIOS)}</Badge>" in page.read_text()
