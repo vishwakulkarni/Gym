@@ -96,7 +96,7 @@ def _base_settings(harness: str, directory: Path, timeout: float) -> DictConfig:
             "legacy": {"harness_overrides": {"workspace_root": workspace}},
         },
         "openclaw": {
-            "probe": ".provider:OpenClawProbe",
+            "probe": ".probes:OpenClawProbe",
             "harness_overrides": {"timeout": math.ceil(timeout)},
             "legacy": {"harness_overrides": {"workspace_root": workspace}},
         },
@@ -112,7 +112,7 @@ def _base_settings(harness: str, directory: Path, timeout: float) -> DictConfig:
             },
         },
         "nooa": {
-            "probe": ".nooa:NOOAProbe",
+            "probe": ".probes:NOOAProbe",
             "required_imports": ["scripts.harness_conformance.nooa"],
             "inherit_adapter_fields": ["nooa"],
             "harness_overrides": {
@@ -171,7 +171,7 @@ def _base_settings(harness: str, directory: Path, timeout: float) -> DictConfig:
     }.get(harness, {})
     return OmegaConf.merge(
         {
-            "probe": ".provider:Probe",
+            "probe": ".probes:Probe",
             # Whether the episode runner must prepare a sandbox for the agent to borrow.
             "requires_sandbox": False,
             "requires_tmux": False,
@@ -212,7 +212,7 @@ def _compaction_settings(harness: str, scenario: Scenario) -> DictConfig:
             },
         },
         "pi": {
-            "probe": ".pi:PiProbe",
+            "probe": ".probes:PiProbe",
             "harness_overrides": context,
             "probe_overrides": {
                 "tool_output_chars": 20000,
