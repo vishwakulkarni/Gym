@@ -21,7 +21,6 @@ execution numbers. There is no dispatch journal or second outcome commit.
 
 import hashlib
 import logging
-import math
 import os
 import time
 import uuid
@@ -36,7 +35,7 @@ from pydantic import ValidationError
 
 from nemo_gym.config.config_types import ConfigError
 from nemo_gym.config.global_config import ATTEMPT_INDEX_KEY_NAME
-from nemo_gym.core.failure_kinds import ROLLOUT_ALLOCATION_ENDED
+from nemo_gym.core.failure_kinds import AGENT_TIMEOUT_INFRASTRUCTURE, ROLLOUT_ALLOCATION_ENDED
 from nemo_gym.rollouts.rollout_records import (
     REJUDGE_OPERATION_ID_KEY,
     REJUDGED_FAILURE_ID_KEY,
@@ -716,14 +715,9 @@ class RolloutStore:
         for row in self.failures():
             key = self._state._key(row)
             if self._state.disposition(key[0]) == "failure" and self._state.settled_failure(key):
-                if not self._state.payloads[key].explicit_fail:
-                    row = row | {"_ng_failure_counts_as_zero": True, "_ng_failure_terminal": True}
-                    if not self._state.payloads[key].final_zero and not (
-                        row.get("evaluation_completed") is True
-                        and type(row.get("reward")) in (int, float)
-                        and math.isfinite(row["reward"])
-                    ):
-                        row["reward"] = 0.0
+                row = row | {"_ng_failure_counts_as_zero": True, "_ng_failure_terminal": True}
+                if self._state.payloads[key].failure_class == AGENT_TIMEOUT_INFRASTRUCTURE:
+                    row["reward"] = 0.0  # The infrastructure fault invalidated the recorded grade.
             rows.append(row)
         return rows
 

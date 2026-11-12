@@ -2872,9 +2872,7 @@ def _final_zero_failure_rows(
 
 def _counts_as_zero(row: Mapping[str, Any], wanted: set) -> bool:
     """Whether a rollout's latest sidecar row enters the metrics as a zero: its class is wanted, or it is marked."""
-    return row.get("failure_outcome_action") != "fail" and (
-        _matches_failure_class(row, wanted) or row.get(NG_FAILURE_COUNTS_AS_ZERO_KEY) is True
-    )
+    return _matches_failure_class(row, wanted) or row.get(NG_FAILURE_COUNTS_AS_ZERO_KEY) is True
 
 
 def _counted_failure_row(row: Dict[str, Any]) -> Dict[str, Any]:
@@ -2889,7 +2887,8 @@ def _counted_failure_row(row: Dict[str, Any]) -> Dict[str, Any]:
     # This metrics-only copy honors the explicit denominator policy. The original
     # answer, failure diagnostics, and training mask remain untouched in the sidecar.
     scored["mask_sample"] = False
-    scored.setdefault("reward", 0.0)
+    if type(scored.get("reward")) not in (int, float) or not math.isfinite(scored["reward"]):
+        scored["reward"] = 0.0
     return scored
 
 
@@ -4798,22 +4797,14 @@ executions → not run again (left to recovery)
         # the denominator, while health still reports it as a failure and no verifier execution is recorded for it.
         rejection: Optional[BaseException] = None
         if config.require_complete:
-            unsettled = await asyncio.to_thread(
-                lambda: [
-                    row
-                    for row in store.failures_for_scoring()
-                    if not row.get(NG_FAILURE_COUNTS_AS_ZERO_KEY) and row.get("failure_outcome_action") != "fail"
-                ]
+            rejection = await asyncio.to_thread(
+                lambda: _credentials_rejected_stop(store.failures()) or _quota_exhausted_stop(store.failures())
             )
-            rejection = _credentials_rejected_stop(unsettled) or _quota_exhausted_stop(unsettled)
         if rejection is None:
             rejection = config.completion_rejection(
                 expected=completion["expected"],
                 results=persisted_results,
-                completed=completion["successful"]
-                - completion.get("masked_retryable", 0)
-                + completion["final_zeros"]
-                + completion.get("failed_excluded", 0),
+                completed=completion["successful"] - completion.get("masked_retryable", 0) + completion["final_zeros"],
                 intentionally_omitted=completion["intentionally_omitted"],
                 retryable=completion["retryable"] > 0,
                 made_progress=store.progress_outcomes_recorded > 0,
@@ -6416,7 +6407,7 @@ class RolloutAggregationHelper(BaseModel):
             if identity not in result_ids and identity not in legacy_counted_ids
         )
         dropped.update(
-            row[NG_FAILURE_CLASS_KEY]
+            row.get(NG_FAILURE_CLASS_KEY) or "unknown"
             for history in histories
             for row in history.failures_for_scoring()
             if not _counts_as_zero(row, wanted)
@@ -6437,11 +6428,6 @@ class RolloutAggregationHelper(BaseModel):
             "unscored": unscored_rollouts,
             "failed": sum(c["failed"] for c in components) if inventory_known else None,
             "failed_final": sum(c["failed_final"] for c in components) if inventory_known else None,
-            **(
-                {"failed_excluded": sum(c.get("failed_excluded", 0) for c in components)}
-                if inventory_known and any(c.get("failed_excluded") for c in components)
-                else {}
-            ),
             "failed_masked": sum(c["failed_masked"] for c in components) if inventory_known else None,
             "failed_not_final": sum(c["failed_not_final"] for c in components) if inventory_known else None,
             "failed_by_class": dict(sum((Counter(c["failed_by_class"]) for c in components), Counter()))

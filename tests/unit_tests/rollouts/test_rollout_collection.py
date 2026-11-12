@@ -3070,19 +3070,17 @@ class TestRolloutCollection:
             assert selected_report.failure_id == failure.event_id
             assert selected_report.events[failure.event_id] == failure.event
             assert "reward" not in oom_row
-            assert len(aggregated["verify_responses"]) == 1
+            assert len(aggregated["verify_responses"]) == 2
         assert oom_row["failure_kind"] == PROVIDER_OOM_KILLED
         assert oom_row["failure_outcome_action"] == ("count_as_zero" if count_as_zero else "fail")
         assert oom_row["ng_agent_observations"]["records"][0]["failure_id"] == failure.event_id
         metrics_fpath = output_jsonl_fpath.with_stem(output_jsonl_fpath.stem + "_aggregate_metrics").with_suffix(
             ".json"
         )
-        assert orjson.loads(metrics_fpath.read_bytes())[0]["key_metrics"]["mean/reward"] == (
-            0.5 if count_as_zero else 1.0
-        )
+        assert orjson.loads(metrics_fpath.read_bytes())[0]["key_metrics"]["mean/reward"] == 0.5
 
-        # Read the actual persisted rows as the recovery/health gate does. A policy zero remains measured and
-        # settled despite evaluation_completed=False; a policy FAIL remains terminal and outside the score.
+        # Raw health evidence remains unchanged: an explicit producer zero is scored there, and a producer FAIL
+        # remains a terminal failure. Collection includes the latter through its scoring-only zero projection.
         from nemo_gym.orchestration.recovery import decide_from_collected, metric_coverage, trial_faults
         from tests.unit_tests.orchestration.test_evaluation_health import _run
 

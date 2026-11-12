@@ -50,7 +50,7 @@ def _rejection(output):
     ).completion_rejection(
         expected=c["expected"],
         results=store.selected("success"),
-        completed=c["successful"] - c["masked_retryable"] + c["final_zeros"] + c.get("failed_excluded", 0),
+        completed=c["successful"] - c["masked_retryable"] + c["final_zeros"],
         retryable=c["retryable"] > 0,
         made_progress=True,
     )
@@ -84,6 +84,7 @@ async def _aggregate(output, monkeypatch, **overrides):
     "failure",
     [
         FAIL,
+        FAIL | {"failure_outcome_action": "fail"},
         {
             "_ng_failure_class": "rollout_allocation_ended",
             "_ng_failure_id": "unclassified",
@@ -101,6 +102,8 @@ async def test_existing_non_retryable_failure_completes_and_enters_denominator(t
     assert compute_aggregate_metrics(scored).key_metrics["mean/reward"] == pytest.approx(338 / 339)
     c = RolloutStore.read(output).coverage()
     assert c["final_zeros"] == c["failed"] == 1 and c["complete"]
+    assert c["stopped_not_retried"] == 0
+    assert RolloutStore.read(output).pending() == []
     assert all(p.read_bytes() == contents for p, contents in before.items())
     assert "_ng_failure_counts_as_zero" not in RolloutStore.read(output).failures()[0]
 
@@ -124,11 +127,11 @@ async def test_all_settled_failures_produce_a_valid_zero_score(tmp_path, monkeyp
 
 @pytest.mark.asyncio
 async def test_zeros_are_not_duplicated_and_completed_grades_stay_intact(tmp_path, monkeypatch):
-    output = _run(tmp_path, [SUCCESS | {"reward": 0.75}, ZERO, FAIL])
+    output = _run(tmp_path, [FAIL | {"reward": 0.75, "evaluation_completed": True}, ZERO, FAIL])
     for _ in range(2):
         scored = await _aggregate(output, monkeypatch)
         assert sorted(r["reward"] for r in scored) == [0.0, 0.0, 0.75]
-        assert RolloutStore.read(output).coverage()["final_zeros"] == 2
+        assert RolloutStore.read(output).coverage()["final_zeros"] == 3
         assert _rejection(output) is None
 
 
@@ -140,35 +143,6 @@ async def test_saved_retry_cap_settles_exhausted_failures(tmp_path, monkeypatch)
     assert _rejection(output) is None
     scored = await _aggregate(output, monkeypatch)
     assert [r["reward"] for r in scored] == [1.0, 0.0]
-
-
-@pytest.mark.asyncio
-async def test_explicit_fail_remains_excluded_not_zero(tmp_path, monkeypatch):
-    output = _run(tmp_path, [SUCCESS, FAIL | {"failure_outcome_action": "fail"}])
-    assert _rejection(output) is None
-    scored = await _aggregate(output, monkeypatch)
-    assert [r["reward"] for r in scored] == [1.0]
-    c = RolloutStore.read(output).coverage()
-    assert c["final_zeros"] == 0 and c["failed_excluded"] == 1
-
-
-@pytest.mark.parametrize("prior_outcome", [SUCCESS, FAIL])
-@pytest.mark.parametrize("new_attempt", [False, True])
-def test_unresolved_dispatch_does_not_settle_from_its_older_outcome(tmp_path, prior_outcome, new_attempt):
-    from nemo_gym.rollouts.omitted_rollouts import omitted_rollout_record
-
-    output = _run(tmp_path, [SUCCESS, prior_outcome])
-    saved = RolloutStore.read(output)
-    rows = [orjson.loads(line) for line in (tmp_path / "source.jsonl").read_bytes().splitlines()]
-    with RolloutStore.start_or_resume(output, lambda: (rows, saved.manifest), resume=True) as store:
-        prior = next(r for r in store.selected("success") + store.failures() if r["_ng_task_index"] == 1)
-        later = prior | {"_ng_attempt_index": int(new_attempt), "_ng_failure_class": "agent_run_error"}
-        store.record_dispatch(later)
-        store.record_unstarted(omitted_rollout_record(later) | {"_ng_unrouted_run_error": True})
-    assert RolloutStore.read(output).coverage()["final_zeros"] == 0
-    # A diagnostic attached to an already-saved success retains that score; a new reservation is missing.
-    if prior_outcome == FAIL or new_attempt:
-        assert _rejection(output) is not None
 
 
 @pytest.mark.parametrize("cap", [1, 3])
@@ -197,49 +171,35 @@ def test_saved_judge_answer_is_not_zeroed_while_reverification_has_budget(tmp_pa
     assert (_rejection(output) is None) == (cap == 1)
 
 
-@pytest.mark.asyncio
-async def test_a_recorded_completed_grade_is_not_replaced_by_the_default_zero(tmp_path, monkeypatch):
-    output = _run(tmp_path, [FAIL | {"reward": 0.75, "evaluation_completed": True}])
-    scored = await _aggregate(output, monkeypatch)
-    assert [row["reward"] for row in scored] == [0.75]
-    assert RolloutStore.read(output).failures()[0]["reward"] == 0.75
-
-
-@pytest.mark.asyncio
-async def test_explicit_fail_wins_over_the_existing_zero_class_override(tmp_path, monkeypatch):
-    output = _run(tmp_path, [SUCCESS, FAIL | {"failure_outcome_action": "fail"}])
-    scored = await _aggregate(output, monkeypatch, count_failure_classes_as_zero=["agent_run_error"])
-    assert [row["reward"] for row in scored] == [1.0]
-
-
-def test_an_explicit_fail_settles_a_saved_judge_answer_without_zeroing_it(tmp_path):
-    failure = {
-        "_ng_failure_class": "judge_failed",
-        "failure_outcome_action": "fail",
-        "response": {
-            "object": "response",
-            "id": "answer-1",
-            "status": "completed",
-            "output": [],
-        },
-    }
-    output = _run(tmp_path, [SUCCESS, failure])
-    assert _rejection(output) is None
-    coverage = RolloutStore.read(output).coverage()
-    assert coverage["failed_excluded"] == 1 and coverage["final_zeros"] == 0
-
-
-def test_an_explicit_fail_does_not_settle_a_still_retryable_episode(tmp_path, monkeypatch):
-    monkeypatch.setenv("NEMO_GYM_MAX_ROLLOUT_ATTEMPTS", "3")
-    output = _run(tmp_path, [SUCCESS, {"_ng_failure_class": "provider_unavailable", "failure_outcome_action": "fail"}])
-    coverage = RolloutStore.read(output).coverage()
-    assert coverage["retryable"] == 1 and not coverage["complete"]
-    assert coverage.get("failed_excluded", 0) == coverage["final_zeros"] == 0
-    assert _rejection(output) is not None
-
-
 def test_unconfirmed_harness_termination_is_not_a_zero_even_at_the_cap(tmp_path, monkeypatch):
     monkeypatch.setenv("NEMO_GYM_MAX_ROLLOUT_ATTEMPTS", "1")
     output = _run(tmp_path, [SUCCESS, {"_ng_failure_class": "harness_termination_unconfirmed"}])
     assert RolloutStore.read(output).coverage()["final_zeros"] == 0
     assert _rejection(output) is not None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("kind", ["provider_credentials_rejected", "provider_quota_exhausted"])
+async def test_provider_stops_are_not_scored_even_offline(tmp_path, monkeypatch, kind):
+    output = _run(tmp_path, [SUCCESS, FAIL | {"failure_kind": kind}])
+    assert _rejection(output) is not None
+    assert RolloutStore.read(output).coverage()["final_zeros"] == 0
+    assert [r["reward"] for r in await _aggregate(output, monkeypatch)] == [1.0]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("cap", [1, 3])
+async def test_infrastructure_timeout_cannot_keep_an_invalidated_grade(tmp_path, monkeypatch, cap):
+    from tests.unit_tests.orchestration.test_recovery_infra_agent_timeout import LAST_503
+
+    monkeypatch.setenv("NEMO_GYM_MAX_ROLLOUT_ATTEMPTS", str(cap))
+    failure = {
+        "reward": 1.0,
+        "evaluation_completed": True,
+        "failure_kind": "agent_timeout",
+        "ng_model_call_capture": {"calls": LAST_503},
+    }
+    output = _run(tmp_path, [failure])
+    assert [r["reward"] for r in await _aggregate(output, monkeypatch)] == ([0.0] if cap == 1 else [])
+    assert bool(RolloutStore.read(output).pending()) == (cap == 3)
+    assert RolloutStore.read(output).failures()[0]["reward"] == 1.0

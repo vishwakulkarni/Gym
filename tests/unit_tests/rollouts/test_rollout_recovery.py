@@ -933,7 +933,8 @@ async def test_reported_kill_shaped_failures_stop_without_spending_budget(runner
     printed = capsys.readouterr().out
     assert "execution 0" in printed and "execution 1" not in printed
     assert "Retry budget exhausted" not in printed
-    assert str(collection.failures_path_for(output)) in printed
+    assert "left to verification recovery" not in printed
+    assert coverage["stopped_not_retried"] == 0 and coverage["final_zeros"] == 2
 
 
 def known_pre_answer_provider_failure():
@@ -2629,19 +2630,22 @@ async def test_a_connection_that_dropped_is_reported_as_possibly_delivered_and_n
     assert outcome.exception_type == "ServerDisconnectedError"
 
 
-async def test_all_explicit_fail_exclusions_still_report_no_score(runner_config, monkeypatch):
+@pytest.mark.parametrize("kind", ["provider_credentials_rejected", "provider_quota_exhausted"])
+@pytest.mark.parametrize("terminal", [False, True])
+async def test_settled_provider_stop_still_prevents_an_aggregate(runner_config, monkeypatch, kind, terminal):
+    from nemo_gym.rollouts.rollout_recovery import IncompleteEvaluationError
+
     runner_config.require_complete = True
     runner_config.disable_aggregation = False
-    failure = {
-        "_ng_failure_class": "agent_run_error",
-        "_ng_failure_terminal": True,
-        "failure_outcome_action": "fail",
-    }
+    monkeypatch.setenv("NEMO_GYM_MAX_ROLLOUT_ATTEMPTS", "1")
+    failure = {"_ng_failure_class": kind, "failure_kind": kind, "_ng_failure_terminal": terminal}
     install_fake_server_client(monkeypatch, AsyncMock(return_value=FakeResponse(200, failure)))
     aggregate = AsyncMock()
     monkeypatch.setattr(RolloutCollectionHelper, "_call_aggregate_metrics", aggregate)
-    with pytest.raises(RuntimeError, match="None of the 3 dispatched"):
+    with pytest.raises(IncompleteEvaluationError) as error:
         await RolloutCollectionHelper().run_from_config(runner_config)
+    assert error.value.failure_kind == kind
     aggregate.assert_not_awaited()
-    coverage = RolloutStore.read(Path(runner_config.output_jsonl_fpath)).coverage()
-    assert coverage["failed_excluded"] == 3 and coverage["final_zeros"] == 0
+    from nemo_gym.cli.eval import _saved_run_complete
+
+    assert not _saved_run_complete(Path(runner_config.output_jsonl_fpath))

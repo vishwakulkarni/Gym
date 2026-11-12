@@ -890,7 +890,7 @@ def _settled_rejection(output: Path, rejected: BaseException) -> BaseException:
         else "No tasks are eligible for retry: inspect terminal failures, omissions and exhausted budgets."
     )
     return IncompleteEvaluationError(
-        f"{coverage['successful'] - coverage.get('masked_retryable', 0) + coverage['final_zeros'] + coverage.get('failed_excluded', 0)}/{coverage['expected']} "
+        f"{coverage['successful'] - coverage.get('masked_retryable', 0) + coverage['final_zeros']}/{coverage['expected']} "
         "samples completed after the "
         f"saved-answer re-verification. Partial artifacts retained at {output}. {guidance}",
         retryable=retryable,
@@ -912,12 +912,7 @@ def _saved_run_complete(output: Path) -> bool:
         coverage = store.coverage()
     except Exception:  # the original rejection stands
         return False
-    completed = (
-        coverage["successful"]
-        - coverage.get("masked_retryable", 0)
-        + coverage["final_zeros"]
-        + coverage.get("failed_excluded", 0)
-    )
+    completed = coverage["successful"] - coverage.get("masked_retryable", 0) + coverage["final_zeros"]
     return completed == coverage["expected"] or has_only_intentional_gaps(
         expected=coverage["expected"], completed=completed, intentionally_omitted=coverage["intentionally_omitted"]
     )
