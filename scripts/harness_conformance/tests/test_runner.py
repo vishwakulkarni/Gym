@@ -916,8 +916,7 @@ def test_checker_error_preserves_independent_ci_measurements(
     output = tmp_path / "table.mdx"
     ci_table.render_ci(artifacts=artifacts, commit=commit, output=output, run_url="https://example.com/run")
     count = len(scenarios) - 1
-    p1 = "—" if failed_scenario == "context_compaction" else '<Badge intent="launch" minimal>1/1</Badge>'
-    assert f'`pi` | <Badge intent="launch" minimal>{count}/{count}</Badge> | {p1} | —' in output.read_text()
+    assert f'`pi` | <Badge intent="launch" minimal>{count}/{count}</Badge> | 0 | 0 | 0 |' in output.read_text()
 
 
 def test_interrupted_run_does_not_publish_completed_summary(tmp_path, monkeypatch):
@@ -965,7 +964,7 @@ def test_compaction_runs_or_declares_failure_at_its_own_priority(retained_episod
         (h, s.name) for h in HARNESSES for s in scenarios if h not in unsupported or s.name != "context_compaction"
     }
     assert code == (0 if gate_tier == "P0" else 1)
-    from scripts.harness_conformance.rendering import scenario_count, scenario_details
+    from scripts.harness_conformance.rendering import scenario_counts, scenario_details
 
     for harness, row in summary["harnesses"].items():
         assert row["verdict"] == ("fulfilled" if gate_tier == "P0" else "not_fulfilled")
@@ -977,9 +976,13 @@ def test_compaction_runs_or_declares_failure_at_its_own_priority(retained_episod
             assert result["checks"][0]["id"] == "scenario.supported"
             assert result["checks"][0]["status"] == "fail"
             assert "does not implement compaction" in result["issues"][0]
-            assert scenario_count([result], tier="P0") == "—"
-            assert "0/1</Badge>" in scenario_count([result], tier="P1")
-            assert "Declared unsupported (not run)" in scenario_details([result])
+            assert scenario_counts([result]) == [
+                '<Badge intent="error" minimal>0/1</Badge>',
+                "0",
+                '<Badge intent="error" minimal>1</Badge>',
+                "0",
+            ]
+            assert "✗ (P1:✗) — not run: declared unsupported" in scenario_details([result])
         else:
             assert result["p0_verdict"] == "fulfilled"
             assert next(c for c in result["checks"] if c["id"] == "compaction.event")["status"] == "fail"
